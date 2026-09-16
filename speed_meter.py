@@ -8,8 +8,6 @@
     python speed_meter.py https://example.com/big-image.jpg
 """
 
-from __future__ import annotations
-
 import argparse
 import errno
 import http.client
@@ -156,7 +154,7 @@ def describe_error(exc: BaseException) -> str:
         if isinstance(exc.reason, BaseException):
             return describe_error(exc.reason)
         return f"ошибка соединения: {exc.reason}"
-    if isinstance(exc, (socket.timeout, TimeoutError)):
+    if isinstance(exc, TimeoutError):
         return "тайм-аут"
     if isinstance(exc, socket.gaierror):
         return f"не удалось найти хост (DNS): {exc}"

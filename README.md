@@ -1,7 +1,5 @@
 # internet-speed-meter
 
-[![CI](https://github.com/r-1805/internet-speed-meter/actions/workflows/ci.yml/badge.svg)](https://github.com/r-1805/internet-speed-meter/actions/workflows/ci.yml)
-
 Скрипт замеряет скорость интернета с вашего компьютера. Он принимает адрес тяжёлого файла
 (например, большой картинки), последовательно выполняет 10 запросов, каждый раз скачивает
 ответ целиком и печатает среднее время запроса, объём скачанных данных и скорость в Мбит/с.
@@ -10,7 +8,7 @@
 
 ## Требования
 
-Python 3.9 или новее. Проверить версию: `python --version` (на Windows может понадобиться `py`).
+Python 3.10 или новее. Проверить версию: `python --version` (на Windows может понадобиться `py`).
 
 ## Установка и запуск
 
@@ -135,8 +133,6 @@ pytest          # тесты поднимают локальный HTTP-серв
 ruff check .
 ruff format --check .
 ```
-
-GitHub Actions на каждый push запускает ruff и тесты на Ubuntu и Windows с Python 3.9 и 3.13.
 
 ## Как использовался AI
 

@@ -244,7 +244,7 @@ def ssl_verify_error(message):
             urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed")),
             "не удалось найти хост",
         ),
-        (urllib.error.URLError(socket.timeout("timed out")), "тайм-аут"),
+        (urllib.error.URLError(TimeoutError("timed out")), "тайм-аут"),
         (urllib.error.URLError("no host given"), "ошибка соединения: no host given"),
         (ConnectionResetError(10054, "reset"), "сервер сбросил соединение"),
         (ssl_verify_error("certificate has expired"), "не прошла проверка SSL-сертификата"),
