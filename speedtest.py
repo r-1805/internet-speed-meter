@@ -17,6 +17,7 @@ import socket
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
@@ -102,7 +103,9 @@ def measure_request(url: str, timeout: float, number: int = 1) -> RequestResult:
 def describe_error(exc: BaseException) -> str:
     """Превращает исключение сети в короткое понятное сообщение."""
     if isinstance(exc, urllib.error.HTTPError):
-        return f"HTTP {exc.code} {exc.reason}"
+        # У ошибки бесконечного редиректа reason многострочный, берём первую строку.
+        reason = str(exc.reason).strip().split("\n", 1)[0]
+        return f"HTTP {exc.code} {reason}"
     if isinstance(exc, urllib.error.URLError):
         # urllib заворачивает настоящую причину (DNS, тайм-аут, отказ) в URLError.
         if isinstance(exc.reason, BaseException):
@@ -193,17 +196,49 @@ def round_floats(data: dict[str, object], digits: int = 6) -> dict[str, object]:
     return {k: round(v, digits) if isinstance(v, float) else v for k, v in data.items()}
 
 
+def normalize_url(url: str) -> str:
+    """Проверяет URL и кодирует символы, которые urllib не принимает как есть.
+
+    Адрес, скопированный из браузера, может содержать кириллицу или пробелы:
+    `https://ru.wikipedia.org/wiki/Тест`. Без кодирования http.client падает
+    с UnicodeEncodeError. Уже закодированные `%XX` не трогаем.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url.strip())
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError(f"некорректный URL: {exc}") from None
+    if parts.scheme.lower() not in ("http", "https"):
+        raise ValueError("URL должен начинаться с http:// или https://")
+    if not parts.hostname:
+        raise ValueError("в URL не указан хост")
+
+    netloc = parts.netloc
+    if not netloc.isascii():
+        host = parts.hostname.encode("idna").decode("ascii")
+        netloc = host if port is None else f"{host}:{port}"
+    path = urllib.parse.quote(parts.path, safe="/%:@!$&'()*+,;=-._~")
+    query = urllib.parse.quote(parts.query, safe="/?%:@!$&'()*+,;=-._~")
+    return urllib.parse.urlunsplit((parts.scheme, netloc, path, query, ""))
+
+
 def positive_int(value: str) -> int:
-    number = int(value)
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"ожидается целое число, получено {value!r}") from None
     if number < 1:
         raise argparse.ArgumentTypeError("должно быть целым числом >= 1")
     return number
 
 
 def positive_float(value: str) -> float:
-    number = float(value)
-    if number <= 0:
-        raise argparse.ArgumentTypeError("должно быть числом > 0")
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"ожидается число, получено {value!r}") from None
+    if not 0 < number < float("inf"):
+        raise argparse.ArgumentTypeError("должно быть конечным числом > 0")
     return number
 
 
@@ -232,30 +267,43 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="вывести результат в JSON вместо текста",
     )
     args = parser.parse_args(argv)
-    if not args.url.lower().startswith(("http://", "https://")):
-        parser.error("URL должен начинаться с http:// или https://")
+    try:
+        args.url = normalize_url(args.url)
+    except ValueError as exc:
+        parser.error(str(exc))
     return args
+
+
+def configure_output() -> None:
+    """При выводе в файл или пайп пишем UTF-8.
+
+    Иначе Python берёт кодировку системы, и на Windows с cp1252
+    `python speedtest.py URL > result.txt` падает на первой кириллической строке.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if not stream.isatty() and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    results: list[RequestResult] = []
 
-    def print_progress(result: RequestResult) -> None:
-        print(format_result(result, args.requests), flush=True)
-
-    try:
+    def on_result(result: RequestResult) -> None:
+        results.append(result)
         if not args.json:
-            print(f"Замер скорости: {args.url}")
-            print(f"Запросов: {args.requests}, тайм-аут: {args.timeout:g} с\n", flush=True)
-        results = run(
-            args.url,
-            args.requests,
-            args.timeout,
-            on_result=None if args.json else print_progress,
-        )
+            print(format_result(result, args.requests), flush=True)
+
+    if not args.json:
+        print(f"Замер скорости: {args.url}")
+        print(f"Запросов: {args.requests}, тайм-аут: {args.timeout:g} с\n", flush=True)
+    interrupted = False
+    try:
+        run(args.url, args.requests, args.timeout, on_result=on_result)
     except KeyboardInterrupt:
-        print("\nПрервано пользователем.", file=sys.stderr)
-        return EXIT_INTERRUPTED
+        # Не теряем уже сделанные замеры: печатаем итог по ним.
+        interrupted = True
+        print("\nПрервано пользователем, итог по выполненным запросам:", file=sys.stderr)
 
     summary = summarize(results)
     if args.json:
@@ -267,8 +315,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(format_summary(summary))
+    if interrupted:
+        return EXIT_INTERRUPTED
     return EXIT_OK if summary.succeeded else EXIT_ALL_FAILED
 
 
 if __name__ == "__main__":
+    configure_output()
     sys.exit(main())
