@@ -27,8 +27,6 @@ from dataclasses import asdict, dataclass
 
 DEFAULT_REQUESTS = 10
 DEFAULT_TIMEOUT = 30.0
-# Буфер чтения. Проверено на локальной петле: readinto с 64 КБ даёт ~27 Гбит/с,
-# то есть скрипт не ограничивает замер даже на 10-гигабитном канале.
 CHUNK_SIZE = 64 * 1024
 BYTES_IN_MB = 1_000_000  # десятичные мегабайты, как у провайдеров
 # Меньше этого размера время уходит в основном на соединение, и скорость неточна.
@@ -112,8 +110,8 @@ def normalize_url(url: str) -> str:
 def measure_request(url: str, timeout: float, number: int) -> RequestResult:
     """Выполняет один GET-запрос и скачивает тело ответа до конца."""
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    # Читаем в заранее выделенный буфер: read() на каждый кусок создаёт и копирует
-    # новый bytes, на локальной петле это в 1.7 раза медленнее.
+    # readinto в один буфер вместо read(): read() на каждый кусок создаёт новый bytes,
+    # и скрипт сам начинает ограничивать замер на быстрых каналах.
     buffer = memoryview(bytearray(CHUNK_SIZE))
     size = 0
     ttfb = None
@@ -182,8 +180,8 @@ def describe_error(exc: BaseException) -> str:
 def measure_all(url: str, count: int, timeout: float) -> Iterator[RequestResult]:
     """Выполняет запросы строго по очереди и отдаёт результат каждого сразу.
 
-    Генератор, а не список: вызывающий код печатает прогресс по мере замера
-    и при Ctrl+C сохраняет уже полученные результаты.
+    Генератор нужен, чтобы печатать прогресс по ходу замера и не терять
+    полученные результаты при Ctrl+C.
     """
     for number in range(1, count + 1):
         yield measure_request(url, timeout, number)

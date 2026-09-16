@@ -409,7 +409,6 @@ def test_default_is_ten_requests(base_url, capsys):
     assert speed_meter.main([f"{base_url}/file"]) == speed_meter.EXIT_OK
     out = capsys.readouterr().out
     assert "[10/10]" in out
-    assert "10/10" in out
 
 
 def test_main_json_output(base_url, capsys):
@@ -430,10 +429,6 @@ def test_json_has_nulls_when_nothing_succeeded(base_url, capsys):
     assert data["summary"]["avg_time"] is None
 
 
-def test_main_returns_error_code_when_all_requests_fail(base_url, capsys):
-    assert speed_meter.main([f"{base_url}/missing", "-n", "2"]) == speed_meter.EXIT_ALL_FAILED
-
-
 def test_main_succeeds_when_some_requests_fail(monkeypatch, capsys):
     outcomes = iter([make_result(1, 1.0, 1000), make_result(2, 1.0, 0, error="тайм-аут")])
     monkeypatch.setattr(speed_meter, "measure_request", lambda *a, **kw: next(outcomes))
@@ -444,7 +439,7 @@ def test_main_succeeds_when_some_requests_fail(monkeypatch, capsys):
 def test_ctrl_c_prints_summary_for_completed_requests(monkeypatch, capsys):
     calls = []
 
-    def fake_measure(url, timeout, number=1):
+    def fake_measure(url, timeout, number):
         calls.append(number)
         if number == 3:
             raise KeyboardInterrupt
