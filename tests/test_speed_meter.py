@@ -389,8 +389,10 @@ def test_warns_about_small_responses():
 
 def test_zero_download_time_does_not_divide_by_zero():
     result = make_result(1, elapsed=0.1, size=10, ttfb=0.1)
-    assert speed_meter.summarize([result]).download_speed_mbit_s is None
+    summary = speed_meter.summarize([result])
+    assert summary.download_speed_mbit_s is None
     assert "н/д" in speed_meter.format_result(result, total=1)
+    assert "Скорость скачивания:      н/д" in speed_meter.format_summary(summary)
 
 
 # --- CLI ---------------------------------------------------------------------
@@ -418,6 +420,17 @@ def test_main_json_output(base_url, capsys):
     assert len(data["requests"]) == 2
     assert data["summary"]["total_bytes"] == 2 * FILE_SIZE
     assert len(data["warnings"]) == 1  # тестовый файл 300 КБ меньше порога
+    floats = [v for r in data["requests"] for v in r.values() if isinstance(v, float)]
+    assert floats and all(v == round(v, 6) for v in floats)
+
+
+def test_text_output_when_nothing_succeeded(base_url, capsys):
+    code = speed_meter.main([f"{base_url}/missing", "-n", "2"])
+    out = capsys.readouterr().out
+    assert code == speed_meter.EXIT_ALL_FAILED
+    assert "ОШИБКА: HTTP 404" in out
+    assert "Ни один запрос не выполнился" in out
+    assert "Скорость скачивания" not in out
 
 
 def test_json_has_nulls_when_nothing_succeeded(base_url, capsys):
@@ -463,6 +476,7 @@ def test_ctrl_c_prints_summary_for_completed_requests(monkeypatch, capsys):
         ["https://example.com", "-n", "0"],
         ["https://example.com", "-n", "abc"],
         ["https://example.com", "-t", "-1"],
+        ["https://example.com", "-t", "abc"],
         ["https://example.com", "-t", "nan"],
         ["https://example.com", "-t", "inf"],
     ],
@@ -472,6 +486,16 @@ def test_invalid_arguments(argv, capsys):
         speed_meter.main(argv)
     assert exc.value.code == 2
     assert "invalid" not in capsys.readouterr().err  # сообщения argparse заменены на русские
+
+
+def test_valid_arguments_are_parsed():
+    args = speed_meter.parse_args(["https://example.com/f", "-n", "3", "-t", "2.5", "--json"])
+    assert (args.url, args.requests, args.timeout, args.json) == (
+        "https://example.com/f",
+        3,
+        2.5,
+        True,
+    )
 
 
 def test_redirected_output_does_not_crash_on_legacy_encoding(base_url):
@@ -490,15 +514,15 @@ def test_redirected_output_does_not_crash_on_legacy_encoding(base_url):
 def test_closed_output_pipe_exits_quietly(base_url):
     # Имитируем `python speed_meter.py URL | head -1`: читатель закрывает пайп,
     # а скрипт ещё пишет. /slow отвечает через 1 с, так что запись точно будет после закрытия.
-    proc = subprocess.Popen(
+    with subprocess.Popen(
         [sys.executable, str(SCRIPT), f"{base_url}/slow", "-n", "2"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-    )
-    proc.stdout.readline()
-    proc.stdout.close()
-    stderr = proc.stderr.read().decode("utf-8", "replace")
-    assert proc.wait(timeout=30) == speed_meter.EXIT_BROKEN_PIPE
+    ) as proc:
+        proc.stdout.readline()
+        proc.stdout.close()
+        stderr = proc.stderr.read().decode("utf-8", "replace")
+        assert proc.wait(timeout=30) == speed_meter.EXIT_BROKEN_PIPE
     assert "Traceback" not in stderr
 
 

@@ -122,8 +122,6 @@ def measure_request(url: str, timeout: float, number: int) -> RequestResult:
             elapsed = time.perf_counter() - start
             headers = response.headers
     except (OSError, http.client.HTTPException) as exc:
-        if isinstance(exc, urllib.error.HTTPError):
-            exc.close()
         return RequestResult(number, time.perf_counter() - start, ttfb, size, describe_error(exc))
     return RequestResult(number, elapsed, ttfb, size, check_complete(headers, size))
 
