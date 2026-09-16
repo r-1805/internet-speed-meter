@@ -21,6 +21,10 @@ SCRIPT = Path(__file__).resolve().parent.parent / "speed_meter.py"
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # нужен для chunked-ответов
+    # Для проверки последовательности: сколько запросов /track обрабатывается одновременно.
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
 
     def do_GET(self):
         routes = {
@@ -34,6 +38,8 @@ class Handler(BaseHTTPRequestHandler):
             "/redirect": self.send_redirect,
             "/redirect-loop": self.send_redirect_loop,
             "/close": self.close_without_response,
+            "/chunked-with-length": self.send_chunked_with_length,
+            "/track": self.send_tracked,
             "/%D0%A2%D0%B5%D1%81%D1%82%20file": self.send_file,  # "/Тест file"
         }
         routes.get(self.path, lambda: self.send_error(404))()
@@ -100,6 +106,24 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Location", "/redirect-loop")
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def send_chunked_with_length(self):
+        # По стандарту при chunked Content-Length игнорируется, даже если он неверный.
+        self.send_response(200)
+        self.send_header("Content-Length", "999999")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        self.wfile.write(b"5\r\nhello\r\n0\r\n\r\n")
+
+    def send_tracked(self):
+        cls = type(self)
+        with cls.lock:
+            cls.active += 1
+            cls.max_active = max(cls.max_active, cls.active)
+        time.sleep(0.05)
+        self.send_file()
+        with cls.lock:
+            cls.active -= 1
 
     def close_without_response(self):
         self.close_connection = True
@@ -184,6 +208,12 @@ def test_truncated_body_is_an_error(base_url):
 def test_truncated_chunked_body_is_an_error(base_url):
     result = speed_meter.measure_request(f"{base_url}/chunked-broken", timeout=5, number=1)
     assert result.error == "соединение оборвалось до конца ответа"
+
+
+def test_chunked_response_ignores_content_length(base_url):
+    result = speed_meter.measure_request(f"{base_url}/chunked-with-length", timeout=5, number=1)
+    assert result.ok, result.error
+    assert result.size == 5
 
 
 def test_server_closed_connection_without_response(base_url):
@@ -277,14 +307,28 @@ def test_non_ascii_url_is_downloaded(base_url):
     assert result.size == FILE_SIZE
 
 
-# --- run ---------------------------------------------------------------------
+# --- measure_all -------------------------------------------------------------
 
 
-def test_run_makes_requests_sequentially_and_reports_progress(base_url):
-    seen = []
-    results = speed_meter.run(f"{base_url}/file", count=3, timeout=5, on_result=seen.append)
-    assert [r.number for r in results] == [1, 2, 3]
-    assert seen == results
+def test_measure_all_runs_requests_one_after_another(base_url):
+    Handler.max_active = 0
+    results = list(speed_meter.measure_all(f"{base_url}/track", count=5, timeout=5))
+    assert [r.number for r in results] == [1, 2, 3, 4, 5]
+    assert all(r.ok for r in results)
+    assert Handler.max_active == 1  # ни разу не было двух запросов одновременно
+
+
+def test_measure_all_yields_each_result_before_next_request(monkeypatch):
+    calls = []
+
+    def fake_measure(url, timeout, number):
+        calls.append(number)
+        return make_result(number, elapsed=1.0, size=1)
+
+    monkeypatch.setattr(speed_meter, "measure_request", fake_measure)
+    measurements = speed_meter.measure_all("http://example.com/", count=3, timeout=1)
+    assert next(measurements).number == 1
+    assert calls == [1]  # следующий запрос не начат, пока не забрали результат
 
 
 # --- summarize ---------------------------------------------------------------

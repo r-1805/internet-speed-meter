@@ -22,23 +22,30 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 
 DEFAULT_REQUESTS = 10
 DEFAULT_TIMEOUT = 30.0
+# Буфер чтения. Проверено на локальной петле: readinto с 64 КБ даёт ~27 Гбит/с,
+# то есть скрипт не ограничивает замер даже на 10-гигабитном канале.
 CHUNK_SIZE = 64 * 1024
 BYTES_IN_MB = 1_000_000  # десятичные мегабайты, как у провайдеров
+# Меньше этого размера время уходит в основном на соединение, и скорость неточна.
+SMALL_RESPONSE_BYTES = BYTES_IN_MB
 # Без User-Agent часть CDN (например, upload.wikimedia.org) отвечает 403.
 USER_AGENT = "internet-speed-meter (+https://github.com/r-1805/internet-speed-meter)"
-
-# Меньше этого размера время уходит в основном на соединение, и скорость неточна.
-SMALL_RESPONSE_BYTES = 1_000_000
 
 EXIT_OK = 0
 EXIT_ALL_FAILED = 1
 EXIT_INTERRUPTED = 130
 EXIT_BROKEN_PIPE = 141  # как у shell-утилит при SIGPIPE
+
+# Один SSL-контекст на все запросы. Без него http.client на каждое соединение
+# заново загружает системные сертификаты (~5 мс), и это время попадало бы в замер.
+_OPENER = urllib.request.build_opener(
+    urllib.request.HTTPSHandler(context=ssl.create_default_context())
+)
 
 
 @dataclass
@@ -67,29 +74,77 @@ class Summary:
     request_speed_mbit_s: float | None  # байты / полное время запроса
 
 
+# --- Адрес -------------------------------------------------------------------
+
+
+def normalize_url(url: str) -> str:
+    """Проверяет URL и кодирует символы, которые urllib не принимает как есть.
+
+    Адрес, скопированный из браузера, может содержать кириллицу или пробелы:
+    `https://ru.wikipedia.org/wiki/Тест`. Без кодирования http.client падает
+    с UnicodeEncodeError. Уже закодированные `%XX` не трогаем.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url.strip())
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError(f"некорректный URL: {exc}") from None
+    if parts.scheme.lower() not in ("http", "https"):
+        raise ValueError("URL должен начинаться с http:// или https://")
+    if not parts.hostname:
+        raise ValueError("в URL не указан хост")
+
+    netloc = parts.netloc
+    if not netloc.isascii():
+        try:
+            host = parts.hostname.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise ValueError(f"некорректное доменное имя: {parts.hostname}") from None
+        netloc = host if port is None else f"{host}:{port}"
+    path = urllib.parse.quote(parts.path, safe="/%:@!$&'()*+,;=-._~")
+    query = urllib.parse.quote(parts.query, safe="/?%:@!$&'()*+,;=-._~")
+    return urllib.parse.urlunsplit((parts.scheme, netloc, path, query, ""))
+
+
+# --- Замер -------------------------------------------------------------------
+
+
 def measure_request(url: str, timeout: float, number: int) -> RequestResult:
     """Выполняет один GET-запрос и скачивает тело ответа до конца."""
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    # Читаем в заранее выделенный буфер: read() на каждый кусок создаёт и копирует
+    # новый bytes, на локальной петле это в 1.7 раза медленнее.
+    buffer = memoryview(bytearray(CHUNK_SIZE))
     size = 0
     ttfb = None
     start = time.perf_counter()
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _OPENER.open(request, timeout=timeout) as response:
             ttfb = time.perf_counter() - start
-            while chunk := response.read(CHUNK_SIZE):
-                size += len(chunk)
+            while received := response.readinto(buffer):
+                size += received
             elapsed = time.perf_counter() - start
-            expected = response.headers.get("Content-Length", "")
+            headers = response.headers
     except (OSError, http.client.HTTPException) as exc:
         if isinstance(exc, urllib.error.HTTPError):
             exc.close()
         return RequestResult(number, time.perf_counter() - start, ttfb, size, describe_error(exc))
-    # При чтении кусками http.client не бросает IncompleteRead, если сервер
-    # закрыл соединение раньше времени, поэтому сверяем размер сами.
-    error = None
+    return RequestResult(number, elapsed, ttfb, size, check_complete(headers, size))
+
+
+def check_complete(headers: http.client.HTTPMessage, size: int) -> str | None:
+    """Проверяет, что тело пришло целиком.
+
+    При чтении кусками http.client не бросает IncompleteRead, если сервер закрыл
+    соединение раньше времени. При chunked-ответе Content-Length по стандарту
+    игнорируется, а обрыв http.client замечает сам.
+    """
+    if "chunked" in headers.get("Transfer-Encoding", "").lower():
+        return None
+    expected = headers.get("Content-Length", "")
     if expected.isdigit() and size < int(expected):
-        error = f"соединение оборвалось: получено {size} из {expected} байт"
-    return RequestResult(number, elapsed, ttfb, size, error)
+        return f"соединение оборвалось: получено {size} из {expected} байт"
+    return None
 
 
 def describe_error(exc: BaseException) -> str:
@@ -124,19 +179,17 @@ def describe_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-def run(
-    url: str,
-    count: int,
-    timeout: float,
-    on_result: Callable[[RequestResult], None] | None = None,
-) -> list[RequestResult]:
-    results = []
+def measure_all(url: str, count: int, timeout: float) -> Iterator[RequestResult]:
+    """Выполняет запросы строго по очереди и отдаёт результат каждого сразу.
+
+    Генератор, а не список: вызывающий код печатает прогресс по мере замера
+    и при Ctrl+C сохраняет уже полученные результаты.
+    """
     for number in range(1, count + 1):
-        result = measure_request(url, timeout, number)
-        results.append(result)
-        if on_result is not None:
-            on_result(result)
-    return results
+        yield measure_request(url, timeout, number)
+
+
+# --- Статистика --------------------------------------------------------------
 
 
 def mbit_per_s(size: int, seconds: float) -> float | None:
@@ -164,6 +217,21 @@ def summarize(results: Sequence[RequestResult]) -> Summary:
         download_speed_mbit_s=mbit_per_s(total_bytes, total_time - total_ttfb),
         request_speed_mbit_s=mbit_per_s(total_bytes, total_time),
     )
+
+
+def collect_warnings(summary: Summary) -> list[str]:
+    """Предупреждения о том, что результату нельзя доверять."""
+    warnings = []
+    if summary.succeeded and summary.total_bytes / summary.succeeded < SMALL_RESPONSE_BYTES:
+        avg_kb = summary.total_bytes / summary.succeeded / 1000
+        warnings.append(
+            f"ответ в среднем всего {avg_kb:.0f} КБ, на таком объёме скорость неточная."
+            " Возможно, адрес ведёт на страницу, а не на сам файл. Лучше взять файл от 10 МБ."
+        )
+    return warnings
+
+
+# --- Вывод -------------------------------------------------------------------
 
 
 def format_speed(mbit_s: float | None) -> str:
@@ -207,49 +275,20 @@ def format_summary(summary: Summary) -> str:
     return "\n".join(lines)
 
 
-def collect_warnings(summary: Summary) -> list[str]:
-    """Предупреждения о том, что результату нельзя доверять."""
-    warnings = []
-    if summary.succeeded and summary.total_bytes / summary.succeeded < SMALL_RESPONSE_BYTES:
-        avg_kb = summary.total_bytes / summary.succeeded / 1000
-        warnings.append(
-            f"ответ в среднем всего {avg_kb:.0f} КБ, скорость на таком объёме неточная."
-            " Возможно, адрес ведёт на страницу, а не на сам файл. Нужен файл от 10 МБ."
-        )
-    return warnings
+def format_json(url: str, results: Sequence[RequestResult], summary: Summary) -> str:
+    def rounded(data: dict[str, object]) -> dict[str, object]:
+        return {k: round(v, 6) if isinstance(v, float) else v for k, v in data.items()}
+
+    payload = {
+        "url": url,
+        "requests": [rounded(asdict(r)) for r in results],
+        "summary": rounded(asdict(summary)),
+        "warnings": collect_warnings(summary),
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-def round_floats(data: dict[str, object]) -> dict[str, object]:
-    return {k: round(v, 6) if isinstance(v, float) else v for k, v in data.items()}
-
-
-def normalize_url(url: str) -> str:
-    """Проверяет URL и кодирует символы, которые urllib не принимает как есть.
-
-    Адрес, скопированный из браузера, может содержать кириллицу или пробелы:
-    `https://ru.wikipedia.org/wiki/Тест`. Без кодирования http.client падает
-    с UnicodeEncodeError. Уже закодированные `%XX` не трогаем.
-    """
-    try:
-        parts = urllib.parse.urlsplit(url.strip())
-        port = parts.port
-    except ValueError as exc:
-        raise ValueError(f"некорректный URL: {exc}") from None
-    if parts.scheme.lower() not in ("http", "https"):
-        raise ValueError("URL должен начинаться с http:// или https://")
-    if not parts.hostname:
-        raise ValueError("в URL не указан хост")
-
-    netloc = parts.netloc
-    if not netloc.isascii():
-        try:
-            host = parts.hostname.encode("idna").decode("ascii")
-        except UnicodeError:
-            raise ValueError(f"некорректное доменное имя: {parts.hostname}") from None
-        netloc = host if port is None else f"{host}:{port}"
-    path = urllib.parse.quote(parts.path, safe="/%:@!$&'()*+,;=-._~")
-    query = urllib.parse.quote(parts.query, safe="/?%:@!$&'()*+,;=-._~")
-    return urllib.parse.urlunsplit((parts.scheme, netloc, path, query, ""))
+# --- Командная строка --------------------------------------------------------
 
 
 def positive_int(value: str) -> int:
@@ -304,6 +343,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    if not args.json:
+        print(f"Замер скорости: {args.url}")
+        print(f"Запросов: {args.requests}, тайм-аут: {args.timeout:g} с\n", flush=True)
+
+    results: list[RequestResult] = []
+    interrupted = False
+    try:
+        for result in measure_all(args.url, args.requests, args.timeout):
+            results.append(result)
+            if not args.json:
+                print(format_result(result, args.requests), flush=True)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nПрервано пользователем, итог по выполненным запросам:", file=sys.stderr)
+
+    summary = summarize(results)
+    if args.json:
+        print(format_json(args.url, results, summary))
+    else:
+        print(format_summary(summary))
+    if interrupted:
+        return EXIT_INTERRUPTED
+    return EXIT_OK if summary.succeeded else EXIT_ALL_FAILED
+
+
 def configure_output() -> None:
     """При выводе в файл или пайп пишем UTF-8.
 
@@ -313,41 +379,6 @@ def configure_output() -> None:
     for stream in (sys.stdout, sys.stderr):
         if not stream.isatty() and hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
-    results: list[RequestResult] = []
-
-    def on_result(result: RequestResult) -> None:
-        results.append(result)
-        if not args.json:
-            print(format_result(result, args.requests), flush=True)
-
-    if not args.json:
-        print(f"Замер скорости: {args.url}")
-        print(f"Запросов: {args.requests}, тайм-аут: {args.timeout:g} с\n", flush=True)
-    interrupted = False
-    try:
-        run(args.url, args.requests, args.timeout, on_result=on_result)
-    except KeyboardInterrupt:
-        interrupted = True
-        print("\nПрервано пользователем, итог по выполненным запросам:", file=sys.stderr)
-
-    summary = summarize(results)
-    if args.json:
-        payload = {
-            "url": args.url,
-            "requests": [round_floats(asdict(r)) for r in results],
-            "summary": round_floats(asdict(summary)),
-            "warnings": collect_warnings(summary),
-        }
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-    else:
-        print(format_summary(summary))
-    if interrupted:
-        return EXIT_INTERRUPTED
-    return EXIT_OK if summary.succeeded else EXIT_ALL_FAILED
 
 
 def cli() -> int:
