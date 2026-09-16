@@ -1,6 +1,8 @@
+import http.client
 import json
 import os
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -31,6 +33,7 @@ class Handler(BaseHTTPRequestHandler):
             "/slow": self.send_slow_headers,
             "/redirect": self.send_redirect,
             "/redirect-loop": self.send_redirect_loop,
+            "/close": self.close_without_response,
             "/%D0%A2%D0%B5%D1%81%D1%82%20file": self.send_file,  # "/Тест file"
         }
         routes.get(self.path, lambda: self.send_error(404))()
@@ -97,6 +100,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Location", "/redirect-loop")
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def close_without_response(self):
+        self.close_connection = True
 
     def log_message(self, format, *args):
         pass
@@ -180,6 +186,11 @@ def test_truncated_chunked_body_is_an_error(base_url):
     assert result.error == "соединение оборвалось до конца ответа"
 
 
+def test_server_closed_connection_without_response(base_url):
+    result = speed_meter.measure_request(f"{base_url}/close", timeout=5, number=1)
+    assert result.error == "сервер закрыл соединение, не отправив ответ"
+
+
 def test_connection_refused_is_reported():
     # Берём свободный порт и закрываем его, чтобы на нём точно никто не слушал.
     with socket.socket() as sock:
@@ -188,6 +199,12 @@ def test_connection_refused_is_reported():
     # Windows повторяет попытку соединения около 2 с, поэтому тайм-аут с запасом.
     result = speed_meter.measure_request(f"http://127.0.0.1:{port}/", timeout=10, number=1)
     assert result.error == "сервер отклонил соединение"
+
+
+def ssl_verify_error(message):
+    exc = ssl.SSLCertVerificationError(1, f"certificate verify failed: {message}")
+    exc.verify_message = message  # в реальном исключении атрибут заполняет модуль ssl
+    return exc
 
 
 @pytest.mark.parametrize(
@@ -199,7 +216,10 @@ def test_connection_refused_is_reported():
         ),
         (urllib.error.URLError(socket.timeout("timed out")), "тайм-аут"),
         (urllib.error.URLError("no host given"), "ошибка соединения: no host given"),
-        (ConnectionResetError(10054, "reset"), "ConnectionResetError"),
+        (ConnectionResetError(10054, "reset"), "сервер сбросил соединение"),
+        (ssl_verify_error("certificate has expired"), "не прошла проверка SSL-сертификата"),
+        (urllib.error.URLError(ssl.SSLError(1, "wrong version")), "ошибка SSL"),
+        (BrokenPipeError(32, "broken pipe"), "BrokenPipeError: [Errno 32] broken pipe"),
     ],
 )
 def test_describe_error(exc, expected):
@@ -234,9 +254,19 @@ def test_normalize_url(url, expected):
     assert speed_meter.normalize_url(url) == expected
 
 
-@pytest.mark.parametrize("url", ["ftp://example.com/f", "example.com/f", "http://", "http://[::1"])
-def test_normalize_url_rejects_invalid(url):
-    with pytest.raises(ValueError):
+@pytest.mark.parametrize(
+    ("url", "message"),
+    [
+        ("ftp://example.com/f", "URL должен начинаться с http:// или https://"),
+        ("example.com/f", "URL должен начинаться с http:// или https://"),
+        ("http://", "в URL не указан хост"),
+        ("http://[::1", "некорректный URL"),
+        ("http://example.com:99999/", "некорректный URL"),
+        ("http://" + "а" * 70 + ".рф/", "некорректное доменное имя"),
+    ],
+)
+def test_normalize_url_rejects_invalid(url, message):
+    with pytest.raises(ValueError, match=message):
         speed_meter.normalize_url(url)
 
 
@@ -302,6 +332,17 @@ def test_summary_without_successful_requests_has_no_metrics(results):
     assert summary.request_speed_mbit_s is None
 
 
+def test_warns_about_small_responses():
+    small = speed_meter.summarize([make_result(1, elapsed=0.2, size=1_118)])
+    (warning,) = speed_meter.collect_warnings(small)
+    assert "1 КБ" in warning
+    assert "Внимание" in speed_meter.format_summary(small)
+
+    big = speed_meter.summarize([make_result(1, elapsed=1.0, size=15_000_000)])
+    assert speed_meter.collect_warnings(big) == []
+    assert "Внимание" not in speed_meter.format_summary(big)
+
+
 def test_zero_download_time_does_not_divide_by_zero():
     result = make_result(1, elapsed=0.1, size=10, ttfb=0.1)
     assert speed_meter.summarize([result]).download_speed_mbit_s is None
@@ -333,6 +374,7 @@ def test_main_json_output(base_url, capsys):
     assert code == speed_meter.EXIT_OK
     assert len(data["requests"]) == 2
     assert data["summary"]["total_bytes"] == 2 * FILE_SIZE
+    assert len(data["warnings"]) == 1  # тестовый файл 300 КБ меньше порога
 
 
 def test_json_has_nulls_when_nothing_succeeded(base_url, capsys):
@@ -404,3 +446,40 @@ def test_redirected_output_does_not_crash_on_legacy_encoding(base_url):
     )
     assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
     assert "Скорость скачивания" in proc.stdout.decode("utf-8")
+
+
+def test_closed_output_pipe_exits_quietly(base_url):
+    # Имитируем `python speed_meter.py URL | head -1`: читатель закрывает пайп,
+    # а скрипт ещё пишет. /slow отвечает через 1 с, так что запись точно будет после закрытия.
+    proc = subprocess.Popen(
+        [sys.executable, str(SCRIPT), f"{base_url}/slow", "-n", "2"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    proc.stdout.readline()
+    proc.stdout.close()
+    stderr = proc.stderr.read().decode("utf-8", "replace")
+    assert proc.wait(timeout=30) == speed_meter.EXIT_BROKEN_PIPE
+    assert "Traceback" not in stderr
+
+
+def all_subclasses(cls):
+    for sub in cls.__subclasses__():
+        yield sub
+        yield from all_subclasses(sub)
+
+
+def test_describe_error_never_raises():
+    # Ошибка внутри обработчика ошибок уронила бы весь замер, поэтому перебираем
+    # все подклассы исключений, которые ловит measure_request.
+    checked = 0
+    for cls in {*all_subclasses(OSError), *all_subclasses(http.client.HTTPException)}:
+        try:
+            exc = cls()
+        except TypeError:
+            continue  # класс требует обязательных аргументов
+        message = speed_meter.describe_error(exc)
+        assert isinstance(message, str) and message
+        assert "\n" not in message
+        checked += 1
+    assert checked > 20

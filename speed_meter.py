@@ -11,9 +11,12 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import http.client
 import json
+import os
 import socket
+import ssl
 import sys
 import time
 import urllib.error
@@ -29,9 +32,13 @@ BYTES_IN_MB = 1_000_000  # десятичные мегабайты, как у п
 # Без User-Agent часть CDN (например, upload.wikimedia.org) отвечает 403.
 USER_AGENT = "internet-speed-meter (+https://github.com/r-1805/internet-speed-meter)"
 
+# Меньше этого размера время уходит в основном на соединение, и скорость неточна.
+SMALL_RESPONSE_BYTES = 1_000_000
+
 EXIT_OK = 0
 EXIT_ALL_FAILED = 1
 EXIT_INTERRUPTED = 130
+EXIT_BROKEN_PIPE = 141  # как у shell-утилит при SIGPIPE
 
 
 @dataclass
@@ -100,8 +107,18 @@ def describe_error(exc: BaseException) -> str:
         return "тайм-аут"
     if isinstance(exc, socket.gaierror):
         return f"не удалось найти хост (DNS): {exc}"
+    # verify_message и reason заполняет модуль ssl, у исключений из других мест их нет.
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return f"не прошла проверка SSL-сертификата: {getattr(exc, 'verify_message', None) or exc}"
+    if isinstance(exc, ssl.SSLError):
+        return f"ошибка SSL: {getattr(exc, 'reason', None) or exc}"
     if isinstance(exc, ConnectionRefusedError):
         return "сервер отклонил соединение"
+    # RemoteDisconnected наследуется от ConnectionResetError, поэтому проверяем раньше.
+    if isinstance(exc, http.client.RemoteDisconnected):
+        return "сервер закрыл соединение, не отправив ответ"
+    if isinstance(exc, ConnectionResetError):
+        return "сервер сбросил соединение"
     if isinstance(exc, http.client.IncompleteRead):
         return "соединение оборвалось до конца ответа"
     return f"{type(exc).__name__}: {exc}"
@@ -186,7 +203,20 @@ def format_summary(summary: Summary) -> str:
         f"Скорость скачивания:      {format_speed(summary.download_speed_mbit_s)}",
         f"С учётом ожидания ответа: {format_speed(summary.request_speed_mbit_s)}",
     ]
+    lines += [f"\nВнимание: {warning}" for warning in collect_warnings(summary)]
     return "\n".join(lines)
+
+
+def collect_warnings(summary: Summary) -> list[str]:
+    """Предупреждения о том, что результату нельзя доверять."""
+    warnings = []
+    if summary.succeeded and summary.total_bytes / summary.succeeded < SMALL_RESPONSE_BYTES:
+        avg_kb = summary.total_bytes / summary.succeeded / 1000
+        warnings.append(
+            f"ответ в среднем всего {avg_kb:.0f} КБ, скорость на таком объёме неточная."
+            " Возможно, адрес ведёт на страницу, а не на сам файл. Нужен файл от 10 МБ."
+        )
+    return warnings
 
 
 def round_floats(data: dict[str, object]) -> dict[str, object]:
@@ -212,7 +242,10 @@ def normalize_url(url: str) -> str:
 
     netloc = parts.netloc
     if not netloc.isascii():
-        host = parts.hostname.encode("idna").decode("ascii")
+        try:
+            host = parts.hostname.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise ValueError(f"некорректное доменное имя: {parts.hostname}") from None
         netloc = host if port is None else f"{host}:{port}"
     path = urllib.parse.quote(parts.path, safe="/%:@!$&'()*+,;=-._~")
     query = urllib.parse.quote(parts.query, safe="/?%:@!$&'()*+,;=-._~")
@@ -307,6 +340,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "url": args.url,
             "requests": [round_floats(asdict(r)) for r in results],
             "summary": round_floats(asdict(summary)),
+            "warnings": collect_warnings(summary),
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
@@ -316,6 +350,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     return EXIT_OK if summary.succeeded else EXIT_ALL_FAILED
 
 
-if __name__ == "__main__":
+def cli() -> int:
     configure_output()
-    sys.exit(main())
+    try:
+        exit_code = main()
+        sys.stdout.flush()
+    except OSError as exc:
+        # Читатель вывода закрылся раньше времени, например `| head -3`.
+        # Unix сообщает об этом как EPIPE, Windows как EINVAL. Сетевые OSError
+        # сюда не доходят: их обрабатывает measure_request.
+        if exc.errno not in (errno.EPIPE, errno.EINVAL):
+            raise
+        # Без этого Python при выходе ещё раз попробует сбросить буфер и упадёт.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        return EXIT_BROKEN_PIPE
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(cli())
