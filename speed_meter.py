@@ -13,6 +13,7 @@ import errno
 import http.client
 import json
 import os
+import re
 import socket
 import ssl
 import sys
@@ -22,6 +23,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
+from typing import NoReturn
 
 DEFAULT_REQUESTS = 10
 DEFAULT_TIMEOUT = 30.0
@@ -82,9 +84,12 @@ def normalize_url(url: str) -> str:
     """
     try:
         parts = urllib.parse.urlsplit(url.strip())
+    except ValueError:
+        raise ValueError(f"некорректный URL: {url}") from None
+    try:
         port = parts.port
-    except ValueError as exc:
-        raise ValueError(f"некорректный URL: {exc}") from None
+    except ValueError:
+        raise ValueError(f"некорректный порт в URL: {url}") from None
     if parts.scheme.lower() not in ("http", "https"):
         raise ValueError("URL должен начинаться с http:// или https://")
     if not parts.hostname:
@@ -305,26 +310,60 @@ def positive_float(value: str) -> float:
     return number
 
 
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Замер скорости интернета: N последовательных скачиваний файла по URL.",
+class RussianHelpFormatter(argparse.HelpFormatter):
+    def add_usage(self, usage, actions, groups, prefix=None):
+        super().add_usage(usage, actions, groups, "использование: " if prefix is None else prefix)
+
+
+class RussianArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser, у которого сообщения об ошибках на русском.
+
+    Заголовки справки задаются группами аргументов в parse_args, а тексты ошибок
+    argparse формирует сам на английском, поэтому переводим их здесь.
+    """
+
+    ERROR_TRANSLATIONS = (
+        (r"^argument (\S+): ", r"\1: "),
+        (r"^the following arguments are required: ", "не указаны обязательные аргументы: "),
+        (r"^unrecognized arguments: ", "неизвестные аргументы: "),
+        (r"expected one argument$", "не указано значение"),
+        (r"ignored explicit argument (.+)$", r"значение \1 не поддерживается"),
     )
-    parser.add_argument("url", help="адрес тяжёлого файла, например большой картинки")
-    parser.add_argument(
+
+    def error(self, message: str) -> NoReturn:
+        for pattern, replacement in self.ERROR_TRANSLATIONS:
+            message = re.sub(pattern, replacement, message)
+        self.print_usage(sys.stderr)
+        self.exit(2, f"{self.prog}: ошибка: {message}\n")
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = RussianArgumentParser(
+        description="Замер скорости интернета: N последовательных скачиваний файла по URL.",
+        formatter_class=RussianHelpFormatter,
+        add_help=False,
+    )
+    arguments = parser.add_argument_group("аргументы")
+    options = parser.add_argument_group("параметры")
+    arguments.add_argument("url", help="адрес тяжёлого файла, например большой картинки")
+    options.add_argument("-h", "--help", action="help", help="показать эту справку и выйти")
+    options.add_argument(
         "-n",
         "--requests",
         type=positive_int,
         default=DEFAULT_REQUESTS,
+        metavar="N",
         help=f"сколько запросов выполнить (по умолчанию {DEFAULT_REQUESTS})",
     )
-    parser.add_argument(
+    options.add_argument(
         "-t",
         "--timeout",
         type=positive_float,
         default=DEFAULT_TIMEOUT,
+        metavar="СЕК",
         help=f"тайм-аут ожидания данных от сервера, с (по умолчанию {DEFAULT_TIMEOUT:g})",
     )
-    parser.add_argument(
+    options.add_argument(
         "--json",
         action="store_true",
         help="вывести результат в JSON вместо текста",

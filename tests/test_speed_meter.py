@@ -291,7 +291,7 @@ def test_normalize_url(url, expected):
         ("example.com/f", "URL должен начинаться с http:// или https://"),
         ("http://", "в URL не указан хост"),
         ("http://[::1", "некорректный URL"),
-        ("http://example.com:99999/", "некорректный URL"),
+        ("http://example.com:99999/", "некорректный порт в URL"),
         ("http://" + "а" * 70 + ".рф/", "некорректное доменное имя"),
     ],
 )
@@ -467,25 +467,46 @@ def test_ctrl_c_prints_summary_for_completed_requests(monkeypatch, capsys):
     assert "Прервано" in captured.err
 
 
+# Слова из встроенных английских сообщений argparse, которых не должно быть в выводе.
+ARGPARSE_ENGLISH = ("usage", "error", "argument", "invalid", "required", "expected", "options")
+
+
 @pytest.mark.parametrize(
-    "argv",
+    ("argv", "message"),
     [
-        ["ftp://example.com/file"],
-        ["example.com/file"],
-        ["http://[::1"],
-        ["https://example.com", "-n", "0"],
-        ["https://example.com", "-n", "abc"],
-        ["https://example.com", "-t", "-1"],
-        ["https://example.com", "-t", "abc"],
-        ["https://example.com", "-t", "nan"],
-        ["https://example.com", "-t", "inf"],
+        ([], "не указаны обязательные аргументы: url"),
+        (["https://example.com", "--foo"], "неизвестные аргументы: --foo"),
+        (["https://example.com", "-n"], "-n/--requests: не указано значение"),
+        (["https://example.com", "--json=1"], "--json: значение '1' не поддерживается"),
+        (["ftp://example.com/file"], "URL должен начинаться с http:// или https://"),
+        (["example.com/file"], "URL должен начинаться с http:// или https://"),
+        (["http://[::1"], "некорректный URL"),
+        (["https://example.com", "-n", "0"], "-n/--requests: должно быть целым числом >= 1"),
+        (["https://example.com", "-n", "abc"], "-n/--requests: ожидается целое число"),
+        (["https://example.com", "-t", "-1"], "-t/--timeout: должно быть конечным числом > 0"),
+        (["https://example.com", "-t", "abc"], "-t/--timeout: ожидается число"),
+        (["https://example.com", "-t", "nan"], "-t/--timeout: должно быть конечным числом > 0"),
+        (["https://example.com", "-t", "inf"], "-t/--timeout: должно быть конечным числом > 0"),
     ],
 )
-def test_invalid_arguments(argv, capsys):
+def test_invalid_arguments(argv, message, capsys):
     with pytest.raises(SystemExit) as exc:
         speed_meter.main(argv)
+    err = capsys.readouterr().err
     assert exc.value.code == 2
-    assert "invalid" not in capsys.readouterr().err  # сообщения argparse заменены на русские
+    assert "использование: " in err
+    assert f"ошибка: {message}" in err
+    assert not any(word in err.lower() for word in ARGPARSE_ENGLISH), err
+
+
+def test_help_is_in_russian(capsys):
+    with pytest.raises(SystemExit) as exc:
+        speed_meter.main(["--help"])
+    out = capsys.readouterr().out
+    assert exc.value.code == 0
+    for text in ("использование:", "аргументы:", "параметры:", "показать эту справку и выйти"):
+        assert text in out
+    assert not any(word in out.lower() for word in (*ARGPARSE_ENGLISH, "show this help"))
 
 
 def test_valid_arguments_are_parsed():
