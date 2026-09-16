@@ -1,18 +1,20 @@
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
-import speedtest
+import speed_meter
 
 FILE_SIZE = 300_000  # больше CHUNK_SIZE, чтобы проверить чтение в несколько кусков
-SCRIPT = Path(__file__).resolve().parent.parent / "speedtest.py"
+SCRIPT = Path(__file__).resolve().parent.parent / "speed_meter.py"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -111,7 +113,7 @@ def base_url():
 
 
 def make_result(number, elapsed, size, ttfb=0.1, error=None):
-    return speedtest.RequestResult(
+    return speed_meter.RequestResult(
         number=number, elapsed=elapsed, ttfb=ttfb, size=size, error=error
     )
 
@@ -120,68 +122,90 @@ def make_result(number, elapsed, size, ttfb=0.1, error=None):
 
 
 def test_downloads_whole_body(base_url):
-    result = speedtest.measure_request(f"{base_url}/file", timeout=5)
+    result = speed_meter.measure_request(f"{base_url}/file", timeout=5, number=1)
     assert result.ok
     assert result.size == FILE_SIZE
     assert 0 < result.ttfb <= result.elapsed
 
 
 def test_reads_until_connection_close_without_content_length(base_url):
-    result = speedtest.measure_request(f"{base_url}/no-length", timeout=5)
+    result = speed_meter.measure_request(f"{base_url}/no-length", timeout=5, number=1)
     assert result.ok
     assert result.size == FILE_SIZE
 
 
 def test_reads_chunked_body(base_url):
-    result = speedtest.measure_request(f"{base_url}/chunked", timeout=5)
+    result = speed_meter.measure_request(f"{base_url}/chunked", timeout=5, number=1)
     assert result.ok
     assert result.size == FILE_SIZE
 
 
 def test_follows_redirect(base_url):
-    result = speedtest.measure_request(f"{base_url}/redirect", timeout=5)
+    result = speed_meter.measure_request(f"{base_url}/redirect", timeout=5, number=1)
     assert result.ok
     assert result.size == FILE_SIZE
 
 
 def test_http_error_is_reported(base_url):
-    result = speedtest.measure_request(f"{base_url}/missing", timeout=5)
+    result = speed_meter.measure_request(f"{base_url}/missing", timeout=5, number=1)
     assert not result.ok
     assert result.error.startswith("HTTP 404")
 
 
 def test_redirect_loop_error_is_single_line(base_url):
-    result = speedtest.measure_request(f"{base_url}/redirect-loop", timeout=5)
+    result = speed_meter.measure_request(f"{base_url}/redirect-loop", timeout=5, number=1)
     assert result.error.startswith("HTTP 302")
     assert "\n" not in result.error
 
 
 def test_timeout_waiting_for_headers(base_url):
-    result = speedtest.measure_request(f"{base_url}/slow", timeout=0.2)
+    result = speed_meter.measure_request(f"{base_url}/slow", timeout=0.2, number=1)
     assert result.error == "тайм-аут"
 
 
 def test_timeout_in_the_middle_of_body(base_url):
-    result = speedtest.measure_request(f"{base_url}/stall", timeout=0.2)
+    result = speed_meter.measure_request(f"{base_url}/stall", timeout=0.2, number=1)
     assert result.error == "тайм-аут"
     assert result.ttfb is not None
 
 
 def test_truncated_body_is_an_error(base_url):
-    result = speedtest.measure_request(f"{base_url}/broken", timeout=5)
+    result = speed_meter.measure_request(f"{base_url}/broken", timeout=5, number=1)
     assert not result.ok
     assert "получено 1000 из 300000 байт" in result.error
 
 
 def test_truncated_chunked_body_is_an_error(base_url):
-    result = speedtest.measure_request(f"{base_url}/chunked-broken", timeout=5)
-    assert not result.ok
+    result = speed_meter.measure_request(f"{base_url}/chunked-broken", timeout=5, number=1)
+    assert result.error == "соединение оборвалось до конца ответа"
 
 
 def test_connection_refused_is_reported():
-    # Порт 1 на localhost почти наверняка закрыт.
-    result = speedtest.measure_request("http://127.0.0.1:1/", timeout=2)
-    assert not result.ok
+    # Берём свободный порт и закрываем его, чтобы на нём точно никто не слушал.
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    # Windows повторяет попытку соединения около 2 с, поэтому тайм-аут с запасом.
+    result = speed_meter.measure_request(f"http://127.0.0.1:{port}/", timeout=10, number=1)
+    assert result.error == "сервер отклонил соединение"
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (
+            urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed")),
+            "не удалось найти хост",
+        ),
+        (urllib.error.URLError(socket.timeout("timed out")), "тайм-аут"),
+        (urllib.error.URLError("no host given"), "ошибка соединения: no host given"),
+        (ConnectionResetError(10054, "reset"), "ConnectionResetError"),
+    ],
+)
+def test_describe_error(exc, expected):
+    message = speed_meter.describe_error(exc)
+    assert message.startswith(expected)
+    assert "\n" not in message
 
 
 # --- normalize_url -----------------------------------------------------------
@@ -207,18 +231,18 @@ def test_connection_refused_is_reported():
     ],
 )
 def test_normalize_url(url, expected):
-    assert speedtest.normalize_url(url) == expected
+    assert speed_meter.normalize_url(url) == expected
 
 
 @pytest.mark.parametrize("url", ["ftp://example.com/f", "example.com/f", "http://", "http://[::1"])
 def test_normalize_url_rejects_invalid(url):
     with pytest.raises(ValueError):
-        speedtest.normalize_url(url)
+        speed_meter.normalize_url(url)
 
 
 def test_non_ascii_url_is_downloaded(base_url):
-    url = speedtest.normalize_url(f"{base_url}/Тест file")
-    result = speedtest.measure_request(url, timeout=5)
+    url = speed_meter.normalize_url(f"{base_url}/Тест file")
+    result = speed_meter.measure_request(url, timeout=5, number=1)
     assert result.ok
     assert result.size == FILE_SIZE
 
@@ -228,7 +252,7 @@ def test_non_ascii_url_is_downloaded(base_url):
 
 def test_run_makes_requests_sequentially_and_reports_progress(base_url):
     seen = []
-    results = speedtest.run(f"{base_url}/file", count=3, timeout=5, on_result=seen.append)
+    results = speed_meter.run(f"{base_url}/file", count=3, timeout=5, on_result=seen.append)
     assert [r.number for r in results] == [1, 2, 3]
     assert seen == results
 
@@ -238,76 +262,97 @@ def test_run_makes_requests_sequentially_and_reports_progress(base_url):
 
 def test_summary_uses_total_bytes_over_total_time():
     results = [
-        make_result(1, elapsed=1.0, size=1_000_000),
-        make_result(2, elapsed=3.0, size=1_000_000),
+        make_result(1, elapsed=1.0, size=1_000_000, ttfb=0.0),
+        make_result(2, elapsed=3.0, size=1_000_000, ttfb=0.0),
     ]
-    summary = speedtest.summarize(results)
+    summary = speed_meter.summarize(results)
     assert summary.total_bytes == 2_000_000
     assert summary.avg_time == pytest.approx(2.0)
-    # 2 МБ за 4 с = 0.5 МБ/с = 4 Мбит/с (а не среднее из 8 и 2.67 Мбит/с).
-    assert summary.speed_mb_s == pytest.approx(0.5)
-    assert summary.speed_mbit_s == pytest.approx(4.0)
+    # 2 МБ за 4 с = 4 Мбит/с, а не среднее из 8 и 2.67 Мбит/с.
+    assert summary.download_speed_mbit_s == pytest.approx(4.0)
+
+
+def test_download_speed_excludes_time_to_first_byte():
+    # 1 МБ: 0.5 с ждали ответ, 0.5 с качали тело.
+    summary = speed_meter.summarize([make_result(1, elapsed=1.0, size=1_000_000, ttfb=0.5)])
+    assert summary.avg_ttfb == pytest.approx(0.5)
+    assert summary.download_speed_mbit_s == pytest.approx(16.0)
+    assert summary.request_speed_mbit_s == pytest.approx(8.0)
 
 
 def test_summary_ignores_failed_requests():
     results = [
-        make_result(1, elapsed=2.0, size=1_000_000),
+        make_result(1, elapsed=2.0, size=1_000_000, ttfb=1.0),
         make_result(2, elapsed=30.0, size=0, ttfb=None, error="тайм-аут"),
     ]
-    summary = speedtest.summarize(results)
+    summary = speed_meter.summarize(results)
     assert (summary.total, summary.succeeded) == (2, 1)
     assert summary.avg_time == pytest.approx(2.0)
-    assert summary.speed_mbit_s == pytest.approx(4.0)
+    assert summary.download_speed_mbit_s == pytest.approx(8.0)
 
 
-def test_summary_when_everything_failed():
-    summary = speedtest.summarize([make_result(1, elapsed=1.0, size=0, error="HTTP 404")])
+@pytest.mark.parametrize(
+    "results", [[], [make_result(1, elapsed=1.0, size=0, ttfb=None, error="HTTP 404")]]
+)
+def test_summary_without_successful_requests_has_no_metrics(results):
+    summary = speed_meter.summarize(results)
     assert summary.succeeded == 0
-    assert summary.speed_mbit_s == 0.0
-    assert summary.avg_time == 0.0
+    assert summary.avg_time is None
+    assert summary.download_speed_mbit_s is None
+    assert summary.request_speed_mbit_s is None
 
 
-def test_summary_of_empty_list():
-    summary = speedtest.summarize([])
-    assert (summary.total, summary.succeeded, summary.speed_mbit_s) == (0, 0, 0.0)
+def test_zero_download_time_does_not_divide_by_zero():
+    result = make_result(1, elapsed=0.1, size=10, ttfb=0.1)
+    assert speed_meter.summarize([result]).download_speed_mbit_s is None
+    assert "н/д" in speed_meter.format_result(result, total=1)
 
 
 # --- CLI ---------------------------------------------------------------------
 
 
 def test_main_prints_summary(base_url, capsys):
-    code = speedtest.main([f"{base_url}/file", "-n", "2"])
+    code = speed_meter.main([f"{base_url}/file", "-n", "2"])
     out = capsys.readouterr().out
-    assert code == speedtest.EXIT_OK
+    assert code == speed_meter.EXIT_OK
     assert "[1/2]" in out and "[2/2]" in out
-    assert "Успешных запросов:     2/2" in out
+    assert "Успешных запросов:        2/2" in out
     assert "Мбит/с" in out
 
 
 def test_default_is_ten_requests(base_url, capsys):
-    assert speedtest.main([f"{base_url}/file"]) == speedtest.EXIT_OK
+    assert speed_meter.main([f"{base_url}/file"]) == speed_meter.EXIT_OK
     out = capsys.readouterr().out
     assert "[10/10]" in out
     assert "10/10" in out
 
 
 def test_main_json_output(base_url, capsys):
-    code = speedtest.main([f"{base_url}/file", "-n", "2", "--json"])
+    code = speed_meter.main([f"{base_url}/file", "-n", "2", "--json"])
     data = json.loads(capsys.readouterr().out)
-    assert code == speedtest.EXIT_OK
+    assert code == speed_meter.EXIT_OK
     assert len(data["requests"]) == 2
     assert data["summary"]["total_bytes"] == 2 * FILE_SIZE
 
 
+def test_json_has_nulls_when_nothing_succeeded(base_url, capsys):
+    code = speed_meter.main([f"{base_url}/missing", "-n", "2", "--json"])
+    data = json.loads(capsys.readouterr().out)
+    assert code == speed_meter.EXIT_ALL_FAILED
+    assert data["requests"][0]["error"].startswith("HTTP 404")
+    assert data["summary"]["download_speed_mbit_s"] is None
+    assert data["summary"]["avg_time"] is None
+
+
 def test_main_returns_error_code_when_all_requests_fail(base_url, capsys):
-    assert speedtest.main([f"{base_url}/missing", "-n", "2"]) == speedtest.EXIT_ALL_FAILED
+    assert speed_meter.main([f"{base_url}/missing", "-n", "2"]) == speed_meter.EXIT_ALL_FAILED
 
 
 def test_main_succeeds_when_some_requests_fail(monkeypatch, capsys):
     outcomes = iter([make_result(1, 1.0, 1000), make_result(2, 1.0, 0, error="тайм-аут")])
-    monkeypatch.setattr(speedtest, "measure_request", lambda *a, **kw: next(outcomes))
-    assert speedtest.main(["http://example.com/f", "-n", "2"]) == speedtest.EXIT_OK
-    assert "Успешных запросов:     1/2" in capsys.readouterr().out
+    monkeypatch.setattr(speed_meter, "measure_request", lambda *a, **kw: next(outcomes))
+    assert speed_meter.main(["http://example.com/f", "-n", "2"]) == speed_meter.EXIT_OK
+    assert "Успешных запросов:        1/2" in capsys.readouterr().out
 
 
 def test_ctrl_c_prints_summary_for_completed_requests(monkeypatch, capsys):
@@ -319,12 +364,12 @@ def test_ctrl_c_prints_summary_for_completed_requests(monkeypatch, capsys):
             raise KeyboardInterrupt
         return make_result(number, elapsed=1.0, size=1_000_000)
 
-    monkeypatch.setattr(speedtest, "measure_request", fake_measure)
-    code = speedtest.main(["http://example.com/f"])
+    monkeypatch.setattr(speed_meter, "measure_request", fake_measure)
+    code = speed_meter.main(["http://example.com/f"])
     captured = capsys.readouterr()
-    assert code == speedtest.EXIT_INTERRUPTED
+    assert code == speed_meter.EXIT_INTERRUPTED
     assert calls == [1, 2, 3]
-    assert "Успешных запросов:     2/2" in captured.out
+    assert "Успешных запросов:        2/2" in captured.out
     assert "Прервано" in captured.err
 
 
@@ -343,13 +388,13 @@ def test_ctrl_c_prints_summary_for_completed_requests(monkeypatch, capsys):
 )
 def test_invalid_arguments(argv, capsys):
     with pytest.raises(SystemExit) as exc:
-        speedtest.main(argv)
+        speed_meter.main(argv)
     assert exc.value.code == 2
     assert "invalid" not in capsys.readouterr().err  # сообщения argparse заменены на русские
 
 
 def test_redirected_output_does_not_crash_on_legacy_encoding(base_url):
-    # Имитируем `python speedtest.py URL > result.txt` на Windows с кодировкой cp1252.
+    # Имитируем `python speed_meter.py URL > result.txt` на Windows с кодировкой cp1252.
     env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), f"{base_url}/file", "-n", "1"],
@@ -358,4 +403,4 @@ def test_redirected_output_does_not_crash_on_legacy_encoding(base_url):
         timeout=30,
     )
     assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
-    assert "Средняя скорость" in proc.stdout.decode("utf-8")
+    assert "Скорость скачивания" in proc.stdout.decode("utf-8")

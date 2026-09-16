@@ -5,7 +5,7 @@
 данных и среднюю скорость в Мбит/с.
 
 Пример:
-    python speedtest.py https://example.com/big-image.jpg
+    python speed_meter.py https://example.com/big-image.jpg
 """
 
 from __future__ import annotations
@@ -25,8 +25,9 @@ from dataclasses import asdict, dataclass
 DEFAULT_REQUESTS = 10
 DEFAULT_TIMEOUT = 30.0
 CHUNK_SIZE = 64 * 1024
-BYTES_IN_MB = 1_000_000  # десятичные мегабайты, как у провайдеров и speedtest-сервисов
-USER_AGENT = "internet-speed-meter/1.0 (+https://github.com/r-1805/internet-speed-meter)"
+BYTES_IN_MB = 1_000_000  # десятичные мегабайты, как у провайдеров
+# Без User-Agent часть CDN (например, upload.wikimedia.org) отвечает 403.
+USER_AGENT = "internet-speed-meter (+https://github.com/r-1805/internet-speed-meter)"
 
 EXIT_OK = 0
 EXIT_ALL_FAILED = 1
@@ -35,11 +36,9 @@ EXIT_INTERRUPTED = 130
 
 @dataclass
 class RequestResult:
-    """Результат одного запроса."""
-
     number: int
-    elapsed: float  # полное время запроса: соединение + заголовки + всё тело, с
-    ttfb: float | None  # время до получения заголовков ответа, с
+    elapsed: float  # полное время запроса: соединение, ожидание ответа, скачивание тела, с
+    ttfb: float | None  # время до первого байта (заголовков) ответа; None, если ответа не было
     size: int  # скачано байт тела ответа
     error: str | None = None
 
@@ -50,32 +49,22 @@ class RequestResult:
 
 @dataclass
 class Summary:
-    """Итоговая статистика по успешным запросам."""
+    """Итог по успешным запросам. Если успешных нет, метрики равны None."""
 
     total: int
     succeeded: int
     total_bytes: int
-    total_time: float
-    avg_time: float
-    avg_ttfb: float
-    speed_mbit_s: float
-    speed_mb_s: float
+    avg_time: float | None
+    avg_ttfb: float | None
+    download_speed_mbit_s: float | None  # байты / время скачивания тела
+    request_speed_mbit_s: float | None  # байты / полное время запроса
 
 
-def measure_request(url: str, timeout: float, number: int = 1) -> RequestResult:
+def measure_request(url: str, timeout: float, number: int) -> RequestResult:
     """Выполняет один GET-запрос и скачивает тело ответа до конца."""
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            # Просим прокси и CDN не отдавать ответ из кэша, иначе замер покажет
-            # скорость кэша, а не канала.
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        },
-    )
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     size = 0
-    ttfb: float | None = None
+    ttfb = None
     start = time.perf_counter()
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -85,25 +74,21 @@ def measure_request(url: str, timeout: float, number: int = 1) -> RequestResult:
             elapsed = time.perf_counter() - start
             expected = response.headers.get("Content-Length", "")
     except (OSError, http.client.HTTPException) as exc:
-        return RequestResult(
-            number=number,
-            elapsed=time.perf_counter() - start,
-            ttfb=ttfb,
-            size=size,
-            error=describe_error(exc),
-        )
+        if isinstance(exc, urllib.error.HTTPError):
+            exc.close()
+        return RequestResult(number, time.perf_counter() - start, ttfb, size, describe_error(exc))
     # При чтении кусками http.client не бросает IncompleteRead, если сервер
     # закрыл соединение раньше времени, поэтому сверяем размер сами.
     error = None
     if expected.isdigit() and size < int(expected):
         error = f"соединение оборвалось: получено {size} из {expected} байт"
-    return RequestResult(number=number, elapsed=elapsed, ttfb=ttfb, size=size, error=error)
+    return RequestResult(number, elapsed, ttfb, size, error)
 
 
 def describe_error(exc: BaseException) -> str:
-    """Превращает исключение сети в короткое понятное сообщение."""
+    """Превращает сетевое исключение в короткое сообщение в одну строку."""
     if isinstance(exc, urllib.error.HTTPError):
-        # У ошибки бесконечного редиректа reason многострочный, берём первую строку.
+        # У ошибки бесконечного редиректа reason многострочный.
         reason = str(exc.reason).strip().split("\n", 1)[0]
         return f"HTTP {exc.code} {reason}"
     if isinstance(exc, urllib.error.URLError):
@@ -115,6 +100,8 @@ def describe_error(exc: BaseException) -> str:
         return "тайм-аут"
     if isinstance(exc, socket.gaierror):
         return f"не удалось найти хост (DNS): {exc}"
+    if isinstance(exc, ConnectionRefusedError):
+        return "сервер отклонил соединение"
     if isinstance(exc, http.client.IncompleteRead):
         return "соединение оборвалось до конца ответа"
     return f"{type(exc).__name__}: {exc}"
@@ -126,7 +113,6 @@ def run(
     timeout: float,
     on_result: Callable[[RequestResult], None] | None = None,
 ) -> list[RequestResult]:
-    """Последовательно выполняет count запросов."""
     results = []
     for number in range(1, count + 1):
         result = measure_request(url, timeout, number)
@@ -136,27 +122,37 @@ def run(
     return results
 
 
-def summarize(results: Sequence[RequestResult]) -> Summary:
-    """Считает статистику только по успешным запросам.
+def mbit_per_s(size: int, seconds: float) -> float | None:
+    return size * 8 / BYTES_IN_MB / seconds if seconds > 0 else None
 
-    Средняя скорость = суммарные байты / суммарное время. Среднее скоростей
-    отдельных запросов не используется: один короткий быстрый запрос завышал
-    бы итог.
+
+def summarize(results: Sequence[RequestResult]) -> Summary:
+    """Считает статистику по успешным запросам.
+
+    Скорость = суммарные байты / суммарное время, а не среднее скоростей
+    отдельных запросов: иначе один быстрый запрос завышал бы итог.
     """
     ok = [r for r in results if r.ok]
+    if not ok:
+        return Summary(len(results), 0, 0, None, None, None, None)
     total_bytes = sum(r.size for r in ok)
     total_time = sum(r.elapsed for r in ok)
-    bytes_per_second = total_bytes / total_time if total_time > 0 else 0.0
+    total_ttfb = sum(r.ttfb for r in ok)
     return Summary(
         total=len(results),
         succeeded=len(ok),
         total_bytes=total_bytes,
-        total_time=total_time,
-        avg_time=total_time / len(ok) if ok else 0.0,
-        avg_ttfb=sum(r.ttfb or 0.0 for r in ok) / len(ok) if ok else 0.0,
-        speed_mbit_s=bytes_per_second * 8 / BYTES_IN_MB,
-        speed_mb_s=bytes_per_second / BYTES_IN_MB,
+        avg_time=total_time / len(ok),
+        avg_ttfb=total_ttfb / len(ok),
+        download_speed_mbit_s=mbit_per_s(total_bytes, total_time - total_ttfb),
+        request_speed_mbit_s=mbit_per_s(total_bytes, total_time),
     )
+
+
+def format_speed(mbit_s: float | None) -> str:
+    if mbit_s is None:
+        return "н/д"
+    return f"{mbit_s:.2f} Мбит/с ({mbit_s / 8:.2f} МБ/с)"
 
 
 def format_result(result: RequestResult, total: int) -> str:
@@ -164,36 +160,37 @@ def format_result(result: RequestResult, total: int) -> str:
     prefix = f"[{result.number:>{width}}/{total}]"
     if not result.ok:
         return f"{prefix}  ОШИБКА: {result.error} (через {result.elapsed:.3f} с)"
-    speed = result.size * 8 / BYTES_IN_MB / result.elapsed if result.elapsed > 0 else 0.0
+    speed = mbit_per_s(result.size, result.elapsed - result.ttfb)
+    speed_text = "н/д" if speed is None else f"{speed:.2f}"
     return (
-        f"{prefix}  {result.elapsed:7.3f} с"
-        f"  (ответ через {result.ttfb or 0.0:.3f} с)"
+        f"{prefix}  {result.elapsed:6.3f} с"
+        f"  (первый байт {result.ttfb:.3f} с)"
         f"  {result.size / BYTES_IN_MB:8.2f} МБ"
-        f"  {speed:8.2f} Мбит/с"
+        f"  {speed_text:>8} Мбит/с"
     )
 
 
 def format_summary(summary: Summary) -> str:
     lines = [
-        "-" * 60,
-        f"Успешных запросов:     {summary.succeeded}/{summary.total}",
+        "-" * 64,
+        f"Успешных запросов:        {summary.succeeded}/{summary.total}",
     ]
-    if summary.succeeded:
-        lines += [
-            f"Скачано всего:         {summary.total_bytes / BYTES_IN_MB:.2f} МБ"
-            f" ({summary.total_bytes} байт)",
-            f"Среднее время запроса: {summary.avg_time:.3f} с",
-            f"Среднее время ответа:  {summary.avg_ttfb:.3f} с",
-            f"Средняя скорость:      {summary.speed_mbit_s:.2f} Мбит/с"
-            f" ({summary.speed_mb_s:.2f} МБ/с)",
-        ]
-    else:
+    if not summary.succeeded:
         lines.append("Ни один запрос не выполнился, скорость посчитать нельзя.")
+        return "\n".join(lines)
+    lines += [
+        f"Скачано всего:            {summary.total_bytes / BYTES_IN_MB:.2f} МБ"
+        f" ({summary.total_bytes} байт)",
+        f"Среднее время запроса:    {summary.avg_time:.3f} с"
+        f" (до первого байта {summary.avg_ttfb:.3f} с)",
+        f"Скорость скачивания:      {format_speed(summary.download_speed_mbit_s)}",
+        f"С учётом ожидания ответа: {format_speed(summary.request_speed_mbit_s)}",
+    ]
     return "\n".join(lines)
 
 
-def round_floats(data: dict[str, object], digits: int = 6) -> dict[str, object]:
-    return {k: round(v, digits) if isinstance(v, float) else v for k, v in data.items()}
+def round_floats(data: dict[str, object]) -> dict[str, object]:
+    return {k: round(v, 6) if isinstance(v, float) else v for k, v in data.items()}
 
 
 def normalize_url(url: str) -> str:
@@ -278,7 +275,7 @@ def configure_output() -> None:
     """При выводе в файл или пайп пишем UTF-8.
 
     Иначе Python берёт кодировку системы, и на Windows с cp1252
-    `python speedtest.py URL > result.txt` падает на первой кириллической строке.
+    `python speed_meter.py URL > result.txt` падает на первой кириллической строке.
     """
     for stream in (sys.stdout, sys.stderr):
         if not stream.isatty() and hasattr(stream, "reconfigure"):
@@ -301,7 +298,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         run(args.url, args.requests, args.timeout, on_result=on_result)
     except KeyboardInterrupt:
-        # Не теряем уже сделанные замеры: печатаем итог по ним.
         interrupted = True
         print("\nПрервано пользователем, итог по выполненным запросам:", file=sys.stderr)
 
