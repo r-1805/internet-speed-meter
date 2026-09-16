@@ -2,26 +2,30 @@
 
 Скрипт замеряет скорость интернета с вашего компьютера. Он принимает адрес тяжёлого файла
 (например, большой картинки), последовательно выполняет 10 запросов, каждый раз скачивает
-ответ целиком и печатает среднее время запроса, объём скачанных данных и скорость в Мбит/с.
+ответ целиком и печатает среднее время запроса, объём скачанных данных и скорость в Мбит/с
+и МБ/с.
 
 Зависимостей нет, только стандартная библиотека Python.
 
 ## Требования
 
-Python 3.10 или новее. Проверить версию: `python --version` (на Windows может понадобиться `py`).
+Python 3.10 или новее. Проверить версию: `python3 --version`.
+
+Команда запуска Python зависит от системы: на Linux и macOS обычно `python3`, на Windows
+`python` или `py`. Ниже везде написано `python3`, подставьте свою.
 
 ## Установка и запуск
 
 ```bash
 git clone https://github.com/r-1805/internet-speed-meter.git
 cd internet-speed-meter
-python speed_meter.py https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg
+python3 speed_meter.py https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg
 ```
 
 Другой адрес для проверки: тестовый файл Cloudflare на 25 МБ. Кавычки нужны из-за `?` в адресе.
 
 ```bash
-python speed_meter.py "https://speed.cloudflare.com/__down?bytes=25000000"
+python3 speed_meter.py "https://speed.cloudflare.com/__down?bytes=25000000"
 ```
 
 ### Параметры
@@ -125,7 +129,7 @@ python speed_meter.py "https://speed.cloudflare.com/__down?bytes=25000000"
 ## Разработка
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 # Windows: .venv\Scripts\activate    Linux/macOS: source .venv/bin/activate
 pip install -r requirements-dev.txt
 
